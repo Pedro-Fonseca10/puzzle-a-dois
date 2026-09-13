@@ -1,6 +1,7 @@
 import { confetti } from './confetti'
 import { decodeImage } from './image'
 import { Net } from './net/room'
+import { hasOwnTurn, probeIce } from './net/turn'
 import { applyDrop, bringToFront, computeSnap, groupById, moveGroup, progress } from './puzzle/engine'
 import { buildGeometry, type Geometry } from './puzzle/geometry'
 import { InputController } from './puzzle/input'
@@ -15,6 +16,8 @@ const HOST_COLOR = '#ef6c4d'
 const GUEST_COLOR = '#2a9d8f'
 const MOVE_INTERVAL = 33
 const CURSOR_INTERVAL = 40
+/** Quanto esperar por um par antes de investigar a rede. */
+const CONNECT_TIMEOUT = 15000
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T
 
@@ -46,6 +49,8 @@ export class Game {
   private moveHandle = 0
   private lastCursorSent = 0
   private toastHandle = 0
+  private connectHandle = 0
+  private diagnosed = false
   private listeners: Array<() => void> = []
 
   constructor(private init: GameInit, private onExit: () => void) {
@@ -66,6 +71,8 @@ export class Game {
       onDrop: m => this.remoteDrop(m),
       onGrab: id => this.remoteGrab(id),
       onCursor: c => this.remoteCursor(c),
+      onJoinError: msg => this.joinFailed(msg),
+      onPeerFailed: () => this.peerFailed(),
     })
     this.bindHud()
   }
@@ -78,6 +85,7 @@ export class Game {
       $('waiting').hidden = false
     }
     this.setStatus()
+    this.connectHandle = window.setTimeout(() => void this.diagnose(), CONNECT_TIMEOUT)
   }
 
   destroy(): void {
@@ -85,6 +93,7 @@ export class Game {
     this.input?.destroy()
     clearInterval(this.timerHandle)
     clearTimeout(this.moveHandle)
+    clearTimeout(this.connectHandle)
     for (const off of this.listeners) off()
     this.net.leave()
   }
@@ -148,6 +157,7 @@ export class Game {
     on('share-close', 'click', () => ($('share').hidden = true))
     on('done-new', 'click', () => this.onExit())
     on('done-close', 'click', () => ($('done').hidden = true))
+    on('net-help-close', 'click', () => this.hideNetHelp())
 
     const persist = () => {
       if (document.visibilityState === 'hidden') this.flushSave()
@@ -161,9 +171,13 @@ export class Game {
   // ---------- network ----------
 
   private async peerJoined(peerId: string): Promise<void> {
+    clearTimeout(this.connectHandle)
+    this.hideNetHelp()
     $('share').hidden = true
     this.setStatus()
     this.toast('Conectados! 💛')
+    // As estatísticas só nomeiam o par vencedor depois que o ICE assenta.
+    window.setTimeout(() => void this.showKind(), 1500)
     if (this.init.role === 'host' && this.state && this.imageBlob) {
       this.commitElapsed()
       try {
@@ -180,6 +194,7 @@ export class Game {
 
   private peerLeft(): void {
     this.setStatus()
+    this.diagnosed = false
     this.view.remoteCursor = null
     this.view.remoteHeldId = null
     this.locked.clear()
@@ -367,6 +382,80 @@ export class Game {
       dot.className = 'dot'
       text.textContent = this.init.role === 'host' ? 'Aguardando a outra pessoa' : 'Procurando a sala…'
     }
+  }
+
+  // ---------- diagnóstico de rede ----------
+
+  /** Distingue "conectado direto" de "conectado via retransmissão" no HUD. */
+  private async showKind(): Promise<void> {
+    if (this.net.peers.size === 0) return
+    const kind = await this.net.kind()
+    if (kind === 'relay') $('status-text').textContent = 'Conectados · via relay'
+  }
+
+  /**
+   * Ninguém apareceu no prazo. Antes de culpar a outra pessoa, verifica se esta
+   * rede consegue sequer produzir um candidato de retransmissão — sem ele, duas
+   * redes diferentes com NAT restrito nunca fecham conexão.
+   */
+  private async diagnose(): Promise<void> {
+    if (this.net.peers.size > 0 || this.diagnosed) return
+    this.diagnosed = true
+    const ice = await probeIce()
+    if (this.net.peers.size > 0) return
+
+    if (!ice.relay && !ice.srflx) {
+      this.showNetHelp(
+        'Sua rede está bloqueando a conexão',
+        'Nem o STUN nem o TURN responderam daqui. Isso costuma ser firewall de rede corporativa ou VPN. ' +
+          'Tente outra rede — mas note que dados móveis normalmente pioram, por causa do CGNAT da operadora.',
+      )
+    } else if (!ice.relay) {
+      this.showNetHelp(
+        'A retransmissão não está disponível',
+        'Esta rede descobriu seu IP público, mas nenhum servidor de retransmissão (TURN) respondeu. ' +
+          'Se vocês dois estiverem em redes diferentes com NAT restrito, a conexão não vai fechar. ' +
+          (hasOwnTurn
+            ? 'Verifique as credenciais do TURN configuradas no projeto.'
+            : 'O projeto está usando o relay público gratuito, que é instável — configure um TURN próprio (ver README).'),
+      )
+    } else {
+      this.showNetHelp(
+        'Tudo certo do seu lado',
+        'Sua rede está pronta para conectar, inclusive com retransmissão. ' +
+          (this.init.role === 'host'
+            ? 'Falta a outra pessoa abrir o link da sala.'
+            : 'Quem criou a sala precisa estar com a página aberta no mesmo link.'),
+      )
+    }
+  }
+
+  private joinFailed(message: string): void {
+    clearTimeout(this.connectHandle)
+    this.showNetHelp(
+      'Não foi possível entrar na sala',
+      `O aperto de mão inicial falhou: ${message}. Recarregue a página; se persistir, sua rede pode estar ` +
+        'bloqueando os relays usados para encontrar a outra pessoa.',
+    )
+  }
+
+  private peerFailed(): void {
+    this.setStatus()
+    this.showNetHelp(
+      'A conexão caiu',
+      'A ligação com a outra pessoa se perdeu por problema de rede, não porque ela saiu. ' +
+        'Vocês dois podem recarregar a página com o mesmo link para retomar de onde parou.',
+    )
+  }
+
+  private showNetHelp(title: string, text: string): void {
+    $('net-help-title').textContent = title
+    $('net-help-text').textContent = text
+    $('net-help').hidden = false
+  }
+
+  private hideNetHelp(): void {
+    $('net-help').hidden = true
   }
 
   private setWaitingProgress(p: number): void {

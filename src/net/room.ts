@@ -1,5 +1,6 @@
 import { joinRoom, selfId, type Room } from 'trystero'
 import type { CursorMsg, DropMsg, MoveMsg, PuzzleState, SnapshotMsg } from '../puzzle/types'
+import { connectionKind, turnServers, type ConnectionKind } from './turn'
 
 export const APP_ID = 'puzzle-a-dois-v1'
 export { selfId }
@@ -14,6 +15,10 @@ export interface NetHandlers {
   onDrop(m: DropMsg): void
   onGrab(id: number): void
   onCursor(c: CursorMsg): void
+  /** O aperto de mão pelos relays falhou — a sala nem chegou a abrir. */
+  onJoinError(message: string): void
+  /** A conexão com um par caiu por falha de rede, não por saída voluntária. */
+  onPeerFailed(peerId: string): void
 }
 
 /** Thin wrapper over a Trystero room: one action per message kind. */
@@ -31,17 +36,14 @@ export class Net {
     this.room = joinRoom(
       {
         appId: APP_ID,
-        // Free public TURN relay as a fallback for restrictive NATs (best effort).
-        turnConfig: [
-          {
-            urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp'],
-            username: 'openrelayproject',
-            credential: 'openrelayproject',
-          },
-        ],
+        // Retransmissão para NATs restritivos; ver src/net/turn.ts.
+        turnConfig: turnServers(),
         relayConfig: { warnOnRelayFailure: false },
       },
       roomId,
+      {
+        onJoinError: ({ error }) => h.onJoinError(error),
+      },
     )
 
     this.snapshot = this.room.makeAction<SnapshotMsg>('snapshot')
@@ -53,6 +55,7 @@ export class Net {
 
     this.room.onPeerJoin = id => {
       this.peers.add(id)
+      this.watchPeer(id, h)
       h.onPeerJoin(id)
     }
     this.room.onPeerLeave = id => {
@@ -70,6 +73,31 @@ export class Net {
     this.drop.onMessage = m => h.onDrop(m)
     this.grab.onMessage = id => h.onGrab(id)
     this.cursor.onMessage = c => h.onCursor(c)
+  }
+
+  /**
+   * Uma conexão que entra em `failed` não dispara onPeerLeave de imediato, e a
+   * diferença importa: queda de rede pede uma mensagem diferente de "a outra
+   * pessoa saiu".
+   */
+  private watchPeer(id: string, h: NetHandlers): void {
+    const pc = this.room.getPeers()[id]
+    if (!pc) return
+    const onChange = () => {
+      if (pc.connectionState === 'failed') {
+        pc.removeEventListener('connectionstatechange', onChange)
+        h.onPeerFailed(id)
+      } else if (pc.connectionState === 'closed') {
+        pc.removeEventListener('connectionstatechange', onChange)
+      }
+    }
+    pc.addEventListener('connectionstatechange', onChange)
+  }
+
+  /** Se a conexão atual passa por TURN ou é direta — só para exibir ao usuário. */
+  async kind(): Promise<ConnectionKind> {
+    const pc = Object.values(this.room.getPeers())[0]
+    return pc ? connectionKind(pc) : 'unknown'
   }
 
   async sendImage(blob: Blob, target?: string): Promise<void> {
